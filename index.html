@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#eef2ee">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Turno">
 <title>Turno</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Figtree:wght@400;500;600&display=swap">
@@ -107,6 +111,10 @@ input[type=text],input[inputmode]{font:inherit;color:var(--ink);background:var(-
 .picker .grid button:hover{border-color:var(--ink)}
 .yours{background:var(--ink);color:var(--bg);border-radius:999px;padding:3px 10px;font-size:.78rem;font-weight:600;align-self:flex-start}
 .hero .yours{background:var(--accent-ink);color:var(--accent)}
+.notif{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font-size:.9rem}
+.notif p{margin:0;color:var(--muted);flex:1;min-width:0}
+.notif.on{background:var(--green-soft);border-color:transparent}
+.notif.on p{color:var(--green)}
 </style>
 
 <div class="wrap" id="app">
@@ -114,6 +122,7 @@ input[type=text],input[inputmode]{font:inherit;color:var(--ink);background:var(-
     <div><h1 id="house-name">Turno</h1><p class="sub">Bins, cleaning and shared shopping · <b>Turno</b></p></div>
     <div class="me" id="me" hidden></div>
   </header>
+  <div class="notif" id="notif" hidden></div>
   <nav role="tablist" id="tabs" style="grid-template-columns:repeat(4,minmax(0,1fr))">
     <button role="tab" data-tab="garbage">Garbage</button>
     <button role="tab" data-tab="cleaning">Cleaning</button>
@@ -127,8 +136,13 @@ input[type=text],input[inputmode]{font:inherit;color:var(--ink);background:var(-
 
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
 <script>
 /* ===== 1. Paste your Firebase config here (Firebase console → Project settings → Your apps → Web app) ===== */
+/* ===== Notifications ===== */
+const VAPID_KEY  = "BIduoagP5ygzI10b4nCrE76u-I3mZdECQwWhLgvqE9RdikExvC7vMq8DVA_HKibX42DbhJ1Dq2HvNC6CfwVjpKg";                 // Firebase → Project settings → Cloud Messaging → Web Push certificates
+const NOTIFY_URL = "https://turno-notify.ch4y9hp48f.workers.dev";                // your Cloudflare Worker address, e.g. https://turno-notify.xxx.workers.dev
+
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyDWwNvpSYH6KSOSnDmc8FIH9ZrGN1tcIX4",
   authDomain: "turno-b4815.firebaseapp.com",
@@ -173,7 +187,7 @@ function render(){
   const me=$("me"),v=$("view"),tabs=$("tabs");
   const title=HOUSE?("House "+S.code):"Turno";
   $("house-name").textContent=title;document.title=HOUSE?title+" · Turno":"Turno";
-  tabs.hidden=true;me.hidden=true;
+  tabs.hidden=true;me.hidden=true;$("notif").hidden=true;
   if(!S.db){v.innerHTML='<div class="empty">The app isn\'t connected to its database yet. Paste the Firebase config into index.html.</div>';return}
   if(!S.code){renderRoom(v);return}
   if(!S.houseLoaded){v.innerHTML='<div class="empty">Opening house '+esc(S.code)+'…</div>';return}
@@ -181,6 +195,7 @@ function render(){
   if(!S.me){renderPicker(v);return}
   tabs.hidden=false;me.hidden=false;
   me.innerHTML=`You are <b>${esc(S.me)}</b> · <button class="linkbtn" data-act="switch">Not you?</button> · <button class="linkbtn" data-act="invite">Copy invite link</button> · <button class="linkbtn" data-act="leave">Other house</button>`;
+  renderNotif();
   document.querySelectorAll("#tabs button").forEach(b=>b.setAttribute("aria-selected",String(b.dataset.tab===S.tab)));
   if(!S.loaded){v.innerHTML='<div class="empty">Loading…</div>';return}
   ({garbage:renderGarbage,cleaning:renderCleaning,expenses:renderExpenses,history:renderHistory})[S.tab](v);
@@ -361,6 +376,54 @@ function renderHistory(v){
   </div><p class="note">Remove an entry if it was tapped by mistake. Removing the latest garbage entry gives the turn back.</p></div>`;
 }
 
+/* ---------- Notifications ---------- */
+const isIOS=/iphone|ipad|ipod/i.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+const isStandalone=window.matchMedia("(display-mode: standalone)").matches||navigator.standalone===true;
+const notifReady=()=>VAPID_KEY.indexOf("PASTE")<0&&NOTIFY_URL.indexOf("PASTE")<0;
+function notifState(){
+  if(!notifReady())return "off-config";
+  if(isIOS&&!isStandalone)return "ios-install";
+  if(!("Notification" in window)||!("serviceWorker" in navigator)||!window.firebase||!firebase.messaging)return "unsupported";
+  if(Notification.permission==="denied")return "denied";
+  if(Notification.permission==="granted"&&lsGet("turno-notif-"+S.code)===S.me)return "on";
+  return "ask";
+}
+function renderNotif(){
+  const el=$("notif");if(!el)return;
+  const st=notifState();
+  if(!S.me||!HOUSE||st==="off-config"||st==="unsupported"){el.hidden=true;return}
+  el.hidden=false;el.className="notif"+(st==="on"?" on":"");
+  el.innerHTML={
+    "ios-install":`<p>To get notifications on iPhone: tap Share <b>⬆︎</b> → <b>Add to Home Screen</b>, then open Turno from your home screen.</p>`,
+    "denied":`<p>Notifications are blocked for this site. Allow them in your phone or browser settings, then reload.</p>`,
+    "on":`<p>🔔 Notifications are on for ${esc(S.me)}.</p>`,
+    "ask":`<p>Get a notification when it's your turn.</p><button class="btn btn-ink btn-small" data-act="notif">🔔 Turn on notifications</button>`
+  }[st];
+}
+async function sha(s){const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("").slice(0,40)}
+async function enableNotif(btn){
+  if(btn)btn.disabled=true;
+  try{
+    const perm=await Notification.requestPermission();
+    if(perm!=="granted"){renderNotif();return}
+    const reg=await navigator.serviceWorker.register("firebase-messaging-sw.js");
+    await navigator.serviceWorker.ready;
+    const token=await firebase.messaging().getToken({vapidKey:VAPID_KEY,serviceWorkerRegistration:reg});
+    if(!token)throw new Error("no token");
+    await S.ref.collection("tokens").doc(await sha(token)).set({member:S.me,token,at:Date.now()});
+    lsSet("turno-notif-"+S.code,S.me);
+    toast("Notifications are on");
+  }catch(e){console.error(e);toast("Couldn't turn on notifications. Try again in a moment.");if(btn)btn.disabled=false}
+  renderNotif();
+}
+function notify(to,title,body){
+  if(!notifReady())return;
+  const list=[...new Set(to)].filter(n=>n&&n!==S.me);
+  if(!list.length)return;
+  fetch(NOTIFY_URL+"/notify",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({house:S.code,to:list,title,body})}).catch(()=>{});
+}
+
 async function write(fn,ok){
   try{await fn();if(ok)toast(ok);return true}
   catch(e){toast("Couldn't save. Check your connection and try again.");return false}
@@ -393,7 +456,10 @@ document.addEventListener("submit",async e=>{
   if(!cents){toast("Enter the price, like 4,50.");return}
   if(!S.ex.split.length){toast("Pick who it's shared between.");return}
   const btn=e.target.querySelector("[type=submit]");btn.disabled=true;
-  const ok=await write(()=>S.ref.collection("expenses").add({kind:"expense",what,cents,paidBy:S.ex.paidBy,split:[...S.ex.split],by:S.me,at:Date.now()}),`Added ${what}`);
+  const split=[...S.ex.split],payer=S.ex.paidBy;
+  const ok=await write(()=>S.ref.collection("expenses").add({kind:"expense",what,cents,paidBy:payer,split,by:S.me,at:Date.now()}),`Added ${what}`);
+  if(ok){const share=Math.round(cents/split.length);
+    notify(split.filter(x=>x!==payer),"💶 New house expense",`${payer} bought ${what} (${eur(cents)}). Your share: ${eur(share)}`)}
   if(ok){S.ex.what="";S.ex.amount=""}
   render();
 });
@@ -403,6 +469,7 @@ document.addEventListener("click",e=>{
   const a=b.dataset.act;if(!a)return;
   if(a==="pick"){S.me=b.dataset.who;lsSet(meKey(),S.me);S.ex.paidBy=S.me;render()}
   else if(a==="switch"){S.me=null;lsSet(meKey(),null);S.ex.paidBy=null;render()}
+  else if(a==="notif"){enableNotif(b)}
   else if(a==="leave"){closeHouse();lsSet("turno-house",null);try{history.replaceState(null,"",location.pathname)}catch(_){}render()}
   else if(a==="invite"){const url=location.origin+location.pathname+"#"+S.code;
     navigator.clipboard&&navigator.clipboard.writeText(url).then(()=>toast("Invite link copied"),()=>toast(url));if(!navigator.clipboard)toast(url)}
@@ -415,7 +482,9 @@ document.addEventListener("click",e=>{
   else if(a==="paidback"){const s=S._st&&S._st[+b.dataset.k];if(!s)return;b.disabled=true;
     write(()=>S.ref.collection("expenses").add({kind:"payment",from:s.from,to:s.to,cents:s.cents,by:S.me,at:Date.now()}),`${s.from} paid ${s.to} ${eur(s.cents)}`)}
   else if(a==="garbage"){const who=b.dataset.who;b.disabled=true;
-    write(()=>S.ref.collection("log").add({type:"garbage",member:who,by:S.me,at:Date.now()}),`Logged: ${who} took it out`)}
+    write(()=>S.ref.collection("log").add({type:"garbage",member:who,by:S.me,at:Date.now()}),`Logged: ${who} took it out`).then(ok=>{
+      if(!ok)return;const m=members(),nx=m[(m.indexOf(who)+1)%m.length];
+      notify([nx],"🗑️ Your turn for the garbage",`${who} just took the garbage out. You're next.`)})}
   else if(a==="clean"){const task=b.dataset.task;b.disabled=true;
     write(()=>S.ref.collection("log").add({type:"clean",task,member:S.me,by:S.me,week:S.week,at:Date.now()}),`${task} done`)}
   else if(a==="del"){const id=b.dataset.id,col=b.dataset.col;
